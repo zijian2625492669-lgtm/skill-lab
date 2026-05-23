@@ -1,5 +1,7 @@
 # skill-lab
 
+Personal AI / automation / coding skill collection.
+
 用于沉淀 AI skill、Prompt 工程、Agent 设计、自动化流程、数据分析脚本和小型实验项目的个人知识与实践仓库。
 
 ## 目录结构
