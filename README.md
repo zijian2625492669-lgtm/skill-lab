@@ -31,3 +31,7 @@ Personal AI / automation / coding skill collection.
 ## 已收录 Skill
 
 - [`excel-data-visualization`](analytics/excel-data-visualization/SKILL.md)：读取 Excel 工作簿字段并生成常用数据分析图表。
+
+## Skill 安装包
+
+- [`excel-data-visualization-skill.zip`](dist/excel-data-visualization-skill.zip)：可下载的 Codex skill 压缩包，解压后得到 `excel-data-visualization/` 目录。
