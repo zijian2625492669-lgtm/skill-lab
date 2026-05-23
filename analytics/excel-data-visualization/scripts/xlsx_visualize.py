@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile Excel workbooks and generate common exploratory charts."""
+"""Profile Excel workbooks, generate charts, and run basic SPSS-style statistics."""
 
 from __future__ import annotations
 
@@ -15,8 +15,11 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
+import statsmodels.api as sm
+from scipy import stats
 
 
 def read_sheet(path: Path, sheet: str | None) -> pd.DataFrame:
@@ -114,6 +117,45 @@ def parse_columns(raw: str | None) -> list[str] | None:
     if not raw:
         return None
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def format_number(value: object, digits: int = 4) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, (int, np.integer)):
+        return str(value)
+    if isinstance(value, (float, np.floating)):
+        if 0 < abs(value) < 10**-digits:
+            return f"<{10**-digits:.{digits}f}"
+        return f"{value:.{digits}f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def markdown_table(rows: list[dict[str, object]], columns: list[str]) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(format_number(row.get(column)) for column in columns) + " |")
+    return "\n".join(lines)
+
+
+def write_analysis_result(result: dict[str, object], args: argparse.Namespace) -> None:
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if args.format == "json":
+            output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        else:
+            output.write_text(result["markdown"], encoding="utf-8")
+        print(f"saved: {output}")
+        return
+
+    if args.format == "json":
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(result["markdown"])
 
 
 def ensure_columns(df: pd.DataFrame, columns: Iterable[str]) -> None:
@@ -257,6 +299,172 @@ def chart_quadrant(df: pd.DataFrame, args: argparse.Namespace) -> None:
         print(f"rows_dropped_missing_fields: {dropped}")
 
 
+def numeric_analysis_frame(df: pd.DataFrame, columns: list[str] | None) -> pd.DataFrame:
+    if columns:
+        ensure_columns(df, columns)
+        frame = df[columns].apply(pd.to_numeric, errors="coerce")
+    else:
+        frame = df.select_dtypes(include="number")
+    if frame.empty:
+        raise SystemExit("No numeric columns available for this analysis.")
+    return frame
+
+
+def analysis_descriptive(df: pd.DataFrame, args: argparse.Namespace) -> dict[str, object]:
+    columns = parse_columns(args.columns)
+    frame = numeric_analysis_frame(df, columns)
+    rows: list[dict[str, object]] = []
+    for column in frame.columns:
+        series = frame[column].dropna()
+        rows.append(
+            {
+                "Variable": column,
+                "N": int(series.count()),
+                "Missing": int(frame[column].isna().sum()),
+                "Mean": series.mean(),
+                "Std. Deviation": series.std(ddof=1),
+                "Minimum": series.min(),
+                "Q1": series.quantile(0.25),
+                "Median": series.median(),
+                "Q3": series.quantile(0.75),
+                "Maximum": series.max(),
+                "Skewness": series.skew(),
+                "Kurtosis": series.kurt(),
+            }
+        )
+    columns_out = [
+        "Variable",
+        "N",
+        "Missing",
+        "Mean",
+        "Std. Deviation",
+        "Minimum",
+        "Q1",
+        "Median",
+        "Q3",
+        "Maximum",
+        "Skewness",
+        "Kurtosis",
+    ]
+    markdown = "# Descriptive Statistics\n\n" + markdown_table(rows, columns_out)
+    return {"analysis": "descriptive", "rows": rows, "markdown": markdown}
+
+
+def pairwise_correlation(x: pd.Series, y: pd.Series, method: str) -> tuple[float, float, int]:
+    valid = pd.concat([x, y], axis=1).dropna()
+    n = len(valid)
+    if n < 3:
+        return np.nan, np.nan, n
+    if method == "spearman":
+        coef, p_value = stats.spearmanr(valid.iloc[:, 0], valid.iloc[:, 1])
+    else:
+        coef, p_value = stats.pearsonr(valid.iloc[:, 0], valid.iloc[:, 1])
+    return float(coef), float(p_value), n
+
+
+def analysis_correlation(df: pd.DataFrame, args: argparse.Namespace) -> dict[str, object]:
+    columns = parse_columns(args.columns)
+    frame = numeric_analysis_frame(df, columns)
+    if frame.shape[1] < 2:
+        raise SystemExit("Correlation analysis requires at least two numeric columns.")
+
+    rows: list[dict[str, object]] = []
+    names = list(frame.columns)
+    for i, left in enumerate(names):
+        for right in names[i + 1 :]:
+            coef, p_value, n = pairwise_correlation(frame[left], frame[right], args.corr_method)
+            rows.append(
+                {
+                    "Variable 1": left,
+                    "Variable 2": right,
+                    "Method": args.corr_method,
+                    "N": n,
+                    "Correlation": coef,
+                    "Sig. (2-tailed)": p_value,
+                }
+            )
+
+    markdown = (
+        f"# Correlation Analysis ({args.corr_method})\n\n"
+        + markdown_table(rows, ["Variable 1", "Variable 2", "Method", "N", "Correlation", "Sig. (2-tailed)"])
+    )
+    return {"analysis": "correlation", "method": args.corr_method, "rows": rows, "markdown": markdown}
+
+
+def analysis_regression(df: pd.DataFrame, args: argparse.Namespace) -> dict[str, object]:
+    predictors = parse_columns(args.x)
+    if not args.y or not predictors:
+        raise SystemExit("Linear regression requires --y and --x predictor columns.")
+    ensure_columns(df, [args.y] + predictors)
+
+    model_df = df[[args.y] + predictors].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(model_df) <= len(predictors) + 1:
+        raise SystemExit("Not enough complete rows for linear regression.")
+
+    y = model_df[args.y]
+    x = sm.add_constant(model_df[predictors], has_constant="add")
+    model = sm.OLS(y, x).fit()
+
+    model_summary = [
+        {"Metric": "Dependent Variable", "Value": args.y},
+        {"Metric": "N", "Value": int(model.nobs)},
+        {"Metric": "R", "Value": math.sqrt(max(model.rsquared, 0))},
+        {"Metric": "R Square", "Value": model.rsquared},
+        {"Metric": "Adjusted R Square", "Value": model.rsquared_adj},
+        {"Metric": "Std. Error of the Estimate", "Value": math.sqrt(model.mse_resid)},
+        {"Metric": "F", "Value": model.fvalue},
+        {"Metric": "Sig. F", "Value": model.f_pvalue},
+        {"Metric": "Df Regression", "Value": int(model.df_model)},
+        {"Metric": "Df Residual", "Value": int(model.df_resid)},
+    ]
+    coefficients: list[dict[str, object]] = []
+    conf_int = model.conf_int()
+    for name in model.params.index:
+        coefficients.append(
+            {
+                "Variable": "Constant" if name == "const" else name,
+                "B": model.params[name],
+                "Std. Error": model.bse[name],
+                "Beta": "" if name == "const" else standardized_beta(model_df, args.y, name),
+                "t": model.tvalues[name],
+                "Sig.": model.pvalues[name],
+                "95% CI Lower": conf_int.loc[name, 0],
+                "95% CI Upper": conf_int.loc[name, 1],
+            }
+        )
+
+    markdown = (
+        "# Linear Regression Analysis\n\n"
+        "## Model Summary\n\n"
+        + markdown_table(model_summary, ["Metric", "Value"])
+        + "\n\n## Coefficients\n\n"
+        + markdown_table(
+            coefficients,
+            ["Variable", "B", "Std. Error", "Beta", "t", "Sig.", "95% CI Lower", "95% CI Upper"],
+        )
+    )
+    return {
+        "analysis": "linear-regression",
+        "dependent": args.y,
+        "predictors": predictors,
+        "model_summary": model_summary,
+        "coefficients": coefficients,
+        "markdown": markdown,
+    }
+
+
+def standardized_beta(model_df: pd.DataFrame, y_column: str, x_column: str) -> float:
+    y_std = model_df[y_column].std(ddof=1)
+    x_std = model_df[x_column].std(ddof=1)
+    if y_std == 0 or x_std == 0:
+        return np.nan
+    y_z = (model_df[y_column] - model_df[y_column].mean()) / y_std
+    x_columns = [column for column in model_df.columns if column != y_column]
+    x_z = (model_df[x_columns] - model_df[x_columns].mean()) / model_df[x_columns].std(ddof=1)
+    fitted = sm.OLS(y_z, sm.add_constant(x_z, has_constant="add")).fit()
+    return float(fitted.params[x_column])
+
+
 def run_profile(args: argparse.Namespace) -> None:
     profile = profile_workbook(Path(args.input), args.sheet)
     if args.format == "json":
@@ -276,6 +484,17 @@ def run_chart(args: argparse.Namespace) -> None:
         "quadrant": chart_quadrant,
     }
     chart_map[args.kind](df, args)
+
+
+def run_analyze(args: argparse.Namespace) -> None:
+    df = read_sheet(Path(args.input), args.sheet)
+    analysis_map = {
+        "descriptive": analysis_descriptive,
+        "correlation": analysis_correlation,
+        "linear-regression": analysis_regression,
+    }
+    result = analysis_map[args.method](df, args)
+    write_analysis_result(result, args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -305,6 +524,22 @@ def build_parser() -> argparse.ArgumentParser:
     chart.add_argument("--split", choices=["mean", "median", "zero"], default="mean")
     chart.add_argument("--title")
     chart.set_defaults(func=run_chart)
+
+    analyze = subparsers.add_parser("analyze", help="Run SPSS-style basic statistical analyses.")
+    analyze.add_argument("--input", required=True)
+    analyze.add_argument("--sheet", help="Sheet name. Defaults to first sheet.")
+    analyze.add_argument(
+        "--method",
+        required=True,
+        choices=["descriptive", "correlation", "linear-regression"],
+    )
+    analyze.add_argument("--columns", help="Comma-separated numeric columns for descriptive/correlation.")
+    analyze.add_argument("--corr-method", choices=["pearson", "spearman"], default="pearson")
+    analyze.add_argument("--y", help="Dependent variable for linear regression.")
+    analyze.add_argument("--x", help="Comma-separated predictors for linear regression.")
+    analyze.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    analyze.add_argument("--output", help="Optional output file for markdown or JSON results.")
+    analyze.set_defaults(func=run_analyze)
     return parser
 
 
