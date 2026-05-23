@@ -27,3 +27,7 @@ Personal AI / automation / coding skill collection.
 - 所有文本文件默认使用 UTF-8 编码。
 - 新内容优先放入对应主题目录，避免堆在仓库根目录。
 - 过期但仍有参考价值的内容移动到 `archive/`。
+
+## 已收录 Skill
+
+- [`excel-data-visualization`](analytics/excel-data-visualization/SKILL.md)：读取 Excel 工作簿字段并生成常用数据分析图表。
